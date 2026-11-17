@@ -133,14 +133,15 @@ async function handleProp(url) {
     .toUpperCase();
   const market = url.searchParams.get("market");
   const lineText = url.searchParams.get("line");
-  const line = Number(lineText);
+  const hasLine = lineText !== null && lineText.trim() !== "";
+  const line = hasLine ? Number(lineText) : null;
   const last = Math.min(
     18,
     Math.max(1, Number(url.searchParams.get("last") || 10))
   );
 
-  if (!name || !PLAYER_MARKETS[market] || lineText === null ||
-      !Number.isFinite(line)) {
+  if (!name || !PLAYER_MARKETS[market] ||
+      (hasLine && !Number.isFinite(line))) {
     return json({
       error: "Provide player, valid market, and numeric line.",
       validMarkets: Object.keys(PLAYER_MARKETS),
@@ -241,16 +242,22 @@ async function handleProp(url) {
   }
 
   const projection = round(baseProjection * matchupFactor);
-  const hits = recentValues.filter(value => value > line).length;
-  const pushes = recentValues.filter(value => value === line).length;
-  const underHits = recentValues.length - hits - pushes;
+  const hits = hasLine
+    ? recentValues.filter(value => value > line).length
+    : null;
+  const pushes = hasLine
+    ? recentValues.filter(value => value === line).length
+    : null;
+  const underHits = hasLine
+    ? recentValues.length - hits - pushes
+    : null;
   const standardDeviation = stdev(recentValues);
-  const estimatedOverProbability = recentValues.length >= 3
+  const estimatedOverProbability = hasLine && recentValues.length >= 3
     ? round(normalSurvival((line - projection) / Math.max(standardDeviation, 0.01)) * 100, 1)
     : null;
 
-  let lean = "No clear lean";
-  if (estimatedOverProbability !== null) {
+  let lean = hasLine ? "No clear lean" : "A prop line is needed for an over/under lean";
+  if (hasLine && estimatedOverProbability !== null) {
     if (estimatedOverProbability >= 55) lean = "Lean Over";
     if (estimatedOverProbability <= 45) lean = "Lean Under";
   }
@@ -280,9 +287,11 @@ async function handleProp(url) {
     overHits: hits,
     underHits,
     pushes,
-    recentOverHitRate: recentValues.length
-      ? round(hits / recentValues.length * 100, 1) + "%"
-      : "No data",
+    recentOverHitRate: !hasLine
+      ? null
+      : recentValues.length
+        ? round(hits / recentValues.length * 100, 1) + "%"
+        : "No data",
     estimatedOverProbability,
     estimatedUnderProbability: estimatedOverProbability === null
       ? null
