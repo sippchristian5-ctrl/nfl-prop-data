@@ -757,7 +757,11 @@ async function loadJson(path) {
   const safePath = path.split("/").map(encodeURIComponent).join("/");
   const source = `${DATA_BASE}/${safePath}`;
   const cache = caches.default;
-  const key = new Request(source, { method: "GET" });
+  // Bump this when the generated JSON schema changes, so deployments do not
+  // reuse older cached player files that lack newly added formula inputs.
+  const key = new Request(`${source}?cache_version=20261117-formulas-v1`, {
+    method: "GET",
+  });
 
   const cached = await cache.match(key);
   if (cached) return cached.json();
