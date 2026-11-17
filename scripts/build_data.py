@@ -72,6 +72,9 @@ def season_rows(season: int, players: pd.DataFrame) -> pd.DataFrame:
             roster, left_on="player_id", right_on="gsis_id", how="left"
         )
 
+    if "team" not in frame.columns:
+        raise ValueError("The weekly player-stat feed is missing the team column.")
+
     for field in STAT_FIELDS:
         if field not in frame.columns:
             frame[field] = 0
@@ -79,7 +82,28 @@ def season_rows(season: int, players: pd.DataFrame) -> pd.DataFrame:
             frame[field], errors="coerce"
         ).fillna(0)
 
+    frame["team"] = frame["team"].map(safe_text)
+    frame["position"] = frame["position"].map(safe_text).str.upper()
+    frame["week"] = pd.to_numeric(frame["week"], errors="coerce")
     return frame
+
+
+def team_week_pass_totals(frame: pd.DataFrame) -> dict:
+    """Sum completions and pass attempts for every team's QB room each week."""
+    quarterbacks = frame[frame["position"].eq("QB")].copy()
+    grouped = quarterbacks.groupby(["team", "week"], dropna=False)[
+        ["completions", "attempts"]
+    ].sum()
+
+    output = {}
+    for (team, week), row in grouped.iterrows():
+        if not team or pd.isna(week):
+            continue
+        output[(str(team), int(week))] = {
+            "completions": safe_number(row["completions"]),
+            "attempts": safe_number(row["attempts"]),
+        }
+    return output
 
 
 def mean_for(games: list[dict], field: str) -> float:
@@ -101,19 +125,34 @@ def weighted_average(current: list[dict], prior: list[dict], field: str) -> floa
     return 0.0
 
 
-def rows_for_player(frame: pd.DataFrame, player_id: str, season: int) -> list[dict]:
+def rows_for_player(
+    frame: pd.DataFrame,
+    player_id: str,
+    season: int,
+    team_totals: dict,
+) -> list[dict]:
     subset = frame[frame["player_id"].eq(player_id)].copy()
     if "week" in subset.columns:
-        subset["week"] = pd.to_numeric(subset["week"], errors="coerce")
         subset = subset.sort_values("week")
 
     games = []
     for _, row in subset.iterrows():
+        week = safe_week(row.get("week"))
+        team = safe_text(row.get("team"))
+        team_stats = team_totals.get((team, week), {}) if week is not None else {}
+
         game = {
             "season": season,
-            "week": safe_week(row.get("week")),
+            "week": week,
+            "team": team,
             "opponent": safe_text(row.get("opponent_team")),
             "homeAway": safe_text(row.get("home_away")),
+            "teamQbCompletions": round(
+                safe_number(team_stats.get("completions")), 2
+            ),
+            "teamPassAttempts": round(
+                safe_number(team_stats.get("attempts")), 2
+            ),
         }
         for field in STAT_FIELDS:
             game[field] = round(safe_number(row.get(field)), 2)
@@ -121,7 +160,13 @@ def rows_for_player(frame: pd.DataFrame, player_id: str, season: int) -> list[di
     return games
 
 
-def build_players(players: pd.DataFrame, current: pd.DataFrame, prior: pd.DataFrame):
+def build_players(
+    players: pd.DataFrame,
+    current: pd.DataFrame,
+    prior: pd.DataFrame,
+    current_team_totals: dict,
+    prior_team_totals: dict,
+):
     player_dir = OUT / "players"
     player_dir.mkdir(parents=True, exist_ok=True)
     shutil.rmtree(player_dir)
@@ -141,8 +186,12 @@ def build_players(players: pd.DataFrame, current: pd.DataFrame, prior: pd.DataFr
         if not player_id or player_id.lower() == "nan":
             continue
 
-        current_games = rows_for_player(current, player_id, CURRENT_SEASON)
-        prior_games = rows_for_player(prior, player_id, PRIOR_SEASON)
+        current_games = rows_for_player(
+            current, player_id, CURRENT_SEASON, current_team_totals
+        )
+        prior_games = rows_for_player(
+            prior, player_id, PRIOR_SEASON, prior_team_totals
+        )
 
         if not current_games and not prior_games:
             continue
@@ -162,7 +211,7 @@ def build_players(players: pd.DataFrame, current: pd.DataFrame, prior: pd.DataFr
         }
 
         payload = {
-            "schemaVersion": 2,
+            "schemaVersion": 3,
             "gsisId": player_id,
             "name": player_name,
             "position": safe_text(row.get("position")),
@@ -172,7 +221,10 @@ def build_players(players: pd.DataFrame, current: pd.DataFrame, prior: pd.DataFr
             "weights": {
                 "currentSeason": CURRENT_WEIGHT,
                 "priorSeason": PRIOR_WEIGHT,
-                "note": "90/10 blend when both seasons have data; uses the available season when only one has data."
+                "note": (
+                    "90/10 blend when both seasons have data; "
+                    "uses the available season when only one has data."
+                ),
             },
             "currentGames": current_games,
             "priorGames": prior_games,
@@ -237,9 +289,7 @@ def build_defense(current: pd.DataFrame, prior: pd.DataFrame):
 
         usable = frame.copy()
         usable["opponent_team"] = usable["opponent_team"].map(safe_text)
-        usable["position"] = (
-            usable["position"].map(safe_text).str.upper()
-        )
+        usable["position"] = usable["position"].map(safe_text).str.upper()
         usable = usable[
             usable["opponent_team"].ne("")
             & usable["position"].isin(POSITIONS)
@@ -389,7 +439,10 @@ def build_defense(current: pd.DataFrame, prior: pd.DataFrame):
         "leagueAveragesAllowed": weighted_league,
         "leagueAveragesBySeason": league_seasons,
         "teamCount": len(team_data),
-        "note": "Team defensive averages are calculated from opposing player weekly statistics by position."
+        "note": (
+            "Team defensive averages are calculated from opposing player "
+            "weekly statistics by position."
+        ),
     }
     (defense_dir / "index.json").write_text(
         json.dumps(defense_index, separators=(",", ":"))
@@ -407,14 +460,21 @@ def main():
     current = season_rows(CURRENT_SEASON, players)
     prior = season_rows(PRIOR_SEASON, players)
 
+    current_team_totals = team_week_pass_totals(current)
+    prior_team_totals = team_week_pass_totals(prior)
+
     index, player_count, search_index_count = build_players(
-        players, current, prior
+        players,
+        current,
+        prior,
+        current_team_totals,
+        prior_team_totals,
     )
     defense_count = build_defense(current, prior)
 
     generated_at = datetime.now(timezone.utc).isoformat()
     metadata = {
-        "schemaVersion": 3,
+        "schemaVersion": 4,
         "generatedAt": generated_at,
         "currentSeason": CURRENT_SEASON,
         "priorSeason": PRIOR_SEASON,
@@ -426,6 +486,7 @@ def main():
         "playerCount": player_count,
         "nameIndexFiles": search_index_count,
         "defenseTeamCount": defense_count,
+        "teamPassTotalsIncluded": True,
         "regularSeasonOnly": True,
         "dataNote": "nflverse updates are not a live in-game feed.",
     }
@@ -439,8 +500,9 @@ def main():
 
     print(
         f"Generated {player_count} player files, "
-        f"{search_index_count} name indexes, and "
-        f"{defense_count} opponent-defense files."
+        f"{search_index_count} name indexes, "
+        f"{defense_count} opponent-defense files, and "
+        f"{len(current_team_totals) + len(prior_team_totals)} team-week QB passing totals."
     )
 
 
