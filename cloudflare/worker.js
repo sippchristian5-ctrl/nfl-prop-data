@@ -472,12 +472,21 @@ function weightedGameMean(currentGames, priorGames, field) {
 }
 
 function weightedDefenseRate(defense, position, numerator, denominator) {
+  const availableSeasons = Object.keys(defense?.seasons || {})
+    .map(Number)
+    .filter(Number.isFinite)
+    .sort((a, b) => b - a);
+  const currentSeason = Number(defense.currentSeason) || availableSeasons[0];
+  const priorSeason = Number(defense.priorSeason) ||
+    availableSeasons.find(season => season < currentSeason);
+
   const currentRate = defenseSeasonRate(
-    defense, defense.currentSeason, position, numerator, denominator
+    defense, currentSeason, position, numerator, denominator
   );
-  const priorRate = defenseSeasonRate(
-    defense, defense.priorSeason, position, numerator, denominator
-  );
+  const priorRate = priorSeason
+    ? defenseSeasonRate(defense, priorSeason, position, numerator, denominator)
+    : null;
+
   return weightedValue(currentRate, priorRate);
 }
 
