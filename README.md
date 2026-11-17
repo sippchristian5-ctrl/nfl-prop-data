@@ -1,40 +1,85 @@
 # NFL Prop Data
 
-Automated compact NFL player and opponent-defense data for a personal prop projection tool.
+Personal NFL player and opponent-defense data pipeline for the Football Project.
 
 ## Data pipeline
 
-- Source: nflverse release files
+- Source: nflverse weekly player-stat releases
 - Current season: 2026
 - Prior season: 2025
-- Default season blend: 90% current season / 10% prior season when both seasons have data
-- Older seasons: excluded from the default data feed
+- Existing season blend preference: 90% current season / 10% prior season when both seasons have data
+- Earlier seasons: excluded from the default projection feed
 - Refresh: daily through GitHub Actions, with manual runs available
 
-Large source CSV files are processed on a GitHub Actions runner, not inside the Cloudflare Worker.
+Large CSV files are processed by GitHub Actions, not inside the Cloudflare Worker.
+
+## Official projection formulas
+
+These formulas follow the user's supplied Football Project documents. The formulas are the primary projection. The additional matchup/situation information is reported separately and does not change the formula result.
+
+### Quarterback passing yards
+
+`QB Average Completions Per Game × (Opponent Passing Yards Allowed ÷ Opponent Completions Allowed)`
+
+The opponent term is yards per completion allowed, not yards per attempt.
+
+### Running back rushing yards
+
+`RB Average Rushing Attempts Per Game × [(RB YPC + Opponent RB YPC Allowed) ÷ 2]`
+
+### Wide receiver receiving yards
+
+`(QB Average Completions × WR Target Share) × [(WR YPR + Opponent WR YPR Allowed) ÷ 2]`
+
+Where WR target share = receiver targets ÷ team pass attempts.
+
+### Running back rushing + receiving yards
+
+`(Carries × [(RB YPC + Opponent RB YPC Allowed) ÷ 2]) + (Targets × [(RB YPT + Opponent RB YPT Allowed) ÷ 2])`
+
+The rushing and receiving portions are calculated separately, then added.
+
+## Season weighting
+
+When both seasons have data, player per-game averages and derived player/defense rates use 90% 2026 and 10% 2025. When only one season has data, the available season is used. This is the project's existing season weighting preference; it does not add a separate recent-form multiplier to the official formula.
+
+## Odds formulas
+
+The separate `/odds` endpoint implements the supplied odds calculations:
+- Negative American odds: `abs(odds) / (abs(odds) + 100)`
+- Positive American odds: `100 / (odds + 100)`
+- Probability edge: `My Projected Probability − Sportsbook Implied Probability`
+- PrizePicks break-even: `1 / Payout Multiplier`
+- Expected value: `(Win Probability × Total Payout) − Entry Cost`
+- Three-pick combined probability: multiply the three probabilities, assuming independence
+
+The formula files do not specify how to create a projected probability from a point-yardage projection. Therefore, the Worker reports historical hit rates separately and does not present them as projected probabilities.
 
 ## Generated files
 
-- `data/metadata.json`: data freshness and source metadata
-- `data/index.json`: full player directory
-- `data/name-index/{initial}.json`: small search indexes, one per first letter found in player-name tokens
-- `data/players/{gsisId}.json`: one player's weekly stats and weighted averages
-- `data/defense/{TEAM}.json`: opponent production allowed by position
-- `data/defense/index.json`: league-average defensive baselines by position and stat
+- `data/metadata.json`: freshness and source metadata
+- `data/index.json`: player directory
+- `data/name-index/{initial}.json`: small player name indexes
+- `data/players/{gsisId}.json`: player weekly stats and team QB completions/pass attempts by game
+- `data/defense/{TEAM}.json`: opponent production allowed by position and week
+- `data/defense/index.json`: league-average defensive baselines
 
 ## Cloudflare Worker
 
-The replacement Worker source is in `cloudflare/worker.js`.
+Replacement Worker source: `cloudflare/worker.js`.
 
-The Worker reads only the small files needed for a request. It does not download or parse the full nflverse CSV files.
+Supported formula markets:
+- `passing_yards` for QBs
+- `rushing_yards` for RBs
+- `receiving_yards` for WRs
+- `rushing_receiving_yards` for RBs
 
-## Projection notes
+The Worker also provides player lookup, stats, game logs, and an `/odds` endpoint.
 
-- Uses recent 2026 game form plus the 90/10 season blend.
-- Opponent adjustments compare the defense's allowed production with the league average for the player's position and market.
-- The opponent adjustment is capped at +/-15%.
-- Estimated probabilities use a normal-distribution approximation based on recent game-to-game variation; they are not sportsbook odds.
-- Injury status, confirmed starting status, weather, game pace, and live in-game data are not included in this version.
-- nflverse is not a live in-game feed; freshness depends on nflverse publishing updated data and the daily build completing.
+## Supporting factors and limitations
+
+Recent 3–5 game volume and production, defensive trends, home/away, injuries, offensive-line availability, depth-chart role, and game script are supporting information. They do not change the official formula projection.
+
+Live verified injury reports, offensive-line availability, depth charts, game script, weather, and stadium surface are not currently integrated into the data feed. nflverse is not a live in-game data source.
 
 Source and licensing information: https://github.com/nflverse/nflverse-data
