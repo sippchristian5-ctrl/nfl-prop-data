@@ -1,6 +1,7 @@
 import json
-import os
+import shutil
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,8 @@ import requests
 
 CURRENT_SEASON = 2026
 PRIOR_SEASON = 2025
+CURRENT_WEIGHT = 0.90
+PRIOR_WEIGHT = 0.10
 BASE = "https://github.com/nflverse/nflverse-data/releases/download"
 OUT = Path("data")
 PLAYER_URL = f"{BASE}/players/players.csv"
@@ -18,12 +21,12 @@ STAT_FIELDS = [
     "receiving_yards", "receptions", "targets", "receiving_tds",
 ]
 ID_COLUMNS = ["player_id", "gsis_id", "player_gsis_id"]
+POSITIONS = ["QB", "RB", "WR", "TE"]
 
 
 def fetch_csv(url: str) -> pd.DataFrame:
-    response = requests.get(url, timeout=90)
+    response = requests.get(url, timeout=120)
     response.raise_for_status()
-    from io import BytesIO
     return pd.read_csv(BytesIO(response.content), low_memory=False)
 
 
@@ -34,109 +37,271 @@ def first_existing(frame: pd.DataFrame, names: list[str]) -> str:
     raise ValueError(f"Missing expected columns: {names}")
 
 
-def clean_num(value):
-    if pd.isna(value):
-        return 0
-    return float(value)
+def safe_text(value) -> str:
+    return "" if pd.isna(value) else str(value).strip()
 
 
-def season_rows(season: int) -> pd.DataFrame:
+def safe_number(value) -> float:
+    return 0.0 if pd.isna(value) else float(value)
+
+
+def safe_week(value):
+    return int(value) if pd.notna(value) else None
+
+
+def season_rows(season: int, players: pd.DataFrame) -> pd.DataFrame:
     url = f"{BASE}/stats_player/stats_player_week_{season}.csv"
     frame = fetch_csv(url)
+
     id_col = first_existing(frame, ID_COLUMNS)
     if id_col != "player_id":
         frame = frame.rename(columns={id_col: "player_id"})
+
     frame["player_id"] = frame["player_id"].fillna("").astype(str)
+
+    # Keep regular-season games for standard player prop analysis.
+    if "season_type" in frame.columns:
+        frame = frame[frame["season_type"].astype(str).str.upper().eq("REG")].copy()
+
+    if "position" not in frame.columns:
+        roster = players[["gsis_id", "position"]].dropna().copy()
+        roster["gsis_id"] = roster["gsis_id"].astype(str)
+        frame = frame.merge(roster, left_on="player_id", right_on="gsis_id", how="left")
+
+    for field in STAT_FIELDS:
+        if field not in frame.columns:
+            frame[field] = 0
+        frame[field] = pd.to_numeric(frame[field], errors="coerce").fillna(0)
+
     return frame
 
 
-def summarize_player(player: dict, current: pd.DataFrame, prior: pd.DataFrame):
-    pid = str(player.get("gsis_id") or "")
-    if not pid:
-        return None
+def mean_for(games: list[dict], field: str) -> float:
+    if not games:
+        return 0.0
+    return sum(float(game.get(field, 0)) for game in games) / len(games)
 
-    current_games = current[current["player_id"] == pid].copy()
-    prior_games = prior[prior["player_id"] == pid].copy() if not prior.empty else pd.DataFrame()
 
-    if "week" in current_games.columns:
-        current_games["week"] = pd.to_numeric(current_games["week"], errors="coerce")
-        current_games = current_games.sort_values("week")
-    if "week" in prior_games.columns:
-        prior_games["week"] = pd.to_numeric(prior_games["week"], errors="coerce")
-        prior_games = prior_games.sort_values("week")
+def weighted_average(current: list[dict], prior: list[dict], field: str) -> float:
+    if current and prior:
+        return mean_for(current, field) * CURRENT_WEIGHT + mean_for(prior, field) * PRIOR_WEIGHT
+    if current:
+        return mean_for(current, field)
+    if prior:
+        return mean_for(prior, field)
+    return 0.0
 
-    def game_rows(frame):
-        rows = []
-        for _, row in frame.iterrows():
-            item = {
-                "season": int(row.get("season", CURRENT_SEASON)),
-                "week": int(row["week"]) if pd.notna(row.get("week")) else None,
-                "opponent": str(row.get("opponent_team") or ""),
+
+def rows_for_player(frame: pd.DataFrame, player_id: str, season: int) -> list[dict]:
+    subset = frame[frame["player_id"].eq(player_id)].copy()
+    if "week" in subset.columns:
+        subset["week"] = pd.to_numeric(subset["week"], errors="coerce")
+        subset = subset.sort_values("week")
+
+    games = []
+    for _, row in subset.iterrows():
+        game = {
+            "season": season,
+            "week": safe_week(row.get("week")),
+            "opponent": safe_text(row.get("opponent_team")),
+            "homeAway": safe_text(row.get("home_away")),
+        }
+        for field in STAT_FIELDS:
+            game[field] = round(safe_number(row.get(field)), 2)
+        games.append(game)
+    return games
+
+
+def build_players(players: pd.DataFrame, current: pd.DataFrame, prior: pd.DataFrame):
+    player_dir = OUT / "players"
+    player_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(player_dir)
+    player_dir.mkdir(parents=True, exist_ok=True)
+
+    index = []
+    count = 0
+
+    for _, row in players.iterrows():
+        player_id = safe_text(row.get("gsis_id"))
+        if not player_id or player_id.lower() == "nan":
+            continue
+
+        current_games = rows_for_player(current, player_id, CURRENT_SEASON)
+        prior_games = rows_for_player(prior, player_id, PRIOR_SEASON)
+
+        if not current_games and not prior_games:
+            continue
+
+        player_name = safe_text(row.get("display_name"))
+        if not player_name:
+            player_name = f"{safe_text(row.get('first_name'))} {safe_text(row.get('last_name'))}".strip()
+
+        weighted = {
+            field: round(weighted_average(current_games, prior_games, field), 2)
+            for field in STAT_FIELDS
+        }
+
+        payload = {
+            "schemaVersion": 2,
+            "gsisId": player_id,
+            "name": player_name,
+            "position": safe_text(row.get("position")),
+            "team": safe_text(row.get("latest_team")),
+            "currentSeason": CURRENT_SEASON,
+            "priorSeason": PRIOR_SEASON,
+            "weights": {
+                "currentSeason": CURRENT_WEIGHT,
+                "priorSeason": PRIOR_WEIGHT,
+                "note": "90/10 blend when both seasons have data; uses the available season when only one has data."
+            },
+            "currentGames": current_games,
+            "priorGames": prior_games,
+            "currentGamesPlayed": len(current_games),
+            "priorGamesPlayed": len(prior_games),
+            "weightedAverages": weighted,
+        }
+
+        (player_dir / f"{player_id}.json").write_text(
+            json.dumps(payload, separators=(",", ":"))
+        )
+        index.append({
+            "gsisId": player_id,
+            "name": player_name,
+            "position": payload["position"],
+            "team": payload["team"],
+        })
+        count += 1
+
+    index.sort(key=lambda player: player["name"].lower())
+    return index, count
+
+
+def build_defense(current: pd.DataFrame, prior: pd.DataFrame):
+    defense_dir = OUT / "defense"
+    defense_dir.mkdir(parents=True, exist_ok=True)
+    shutil.rmtree(defense_dir)
+    defense_dir.mkdir(parents=True, exist_ok=True)
+
+    team_data = {}
+
+    for season, frame in [(CURRENT_SEASON, current), (PRIOR_SEASON, prior)]:
+        if frame.empty or "opponent_team" not in frame.columns or "position" not in frame.columns:
+            continue
+
+        usable = frame.copy()
+        usable["opponent_team"] = usable["opponent_team"].map(safe_text)
+        usable["position"] = usable["position"].map(safe_text).str.upper()
+        usable = usable[
+            usable["opponent_team"].ne("") & usable["position"].isin(POSITIONS)
+        ]
+
+        grouped = (
+            usable.groupby(["opponent_team", "position", "week"], dropna=False)[STAT_FIELDS]
+            .sum()
+            .reset_index()
+        )
+
+        for (team, position), rows in grouped.groupby(["opponent_team", "position"]):
+            if team not in team_data:
+                team_data[team] = {
+                    "team": team,
+                    "source": "nflverse player weekly stats",
+                    "seasons": {},
+                }
+
+            rows = rows.sort_values("week")
+            weekly = []
+            for _, row in rows.iterrows():
+                stats = {
+                    field: round(safe_number(row.get(field)), 2)
+                    for field in STAT_FIELDS
+                }
+                weekly.append({
+                    "week": safe_week(row.get("week")),
+                    "statsAllowed": stats,
+                })
+
+            averages = {
+                field: round(
+                    sum(item["statsAllowed"][field] for item in weekly) / len(weekly), 2
+                ) if weekly else 0
+                for field in STAT_FIELDS
             }
+
+            team_data[team]["seasons"].setdefault(str(season), {})[position] = {
+                "games": len(weekly),
+                "perGameAverageAllowed": averages,
+                "weekly": weekly,
+            }
+
+    for team, payload in team_data.items():
+        current_positions = payload["seasons"].get(str(CURRENT_SEASON), {})
+        prior_positions = payload["seasons"].get(str(PRIOR_SEASON), {})
+        weighted_positions = {}
+
+        for position in POSITIONS:
+            current_stats = current_positions.get(position, {}).get("perGameAverageAllowed", {})
+            prior_stats = prior_positions.get(position, {}).get("perGameAverageAllowed", {})
+            if not current_stats and not prior_stats:
+                continue
+
+            weighted_positions[position] = {}
             for field in STAT_FIELDS:
-                if field in frame.columns:
-                    item[field] = clean_num(row.get(field))
-            rows.append(item)
-        return rows
+                if current_stats and prior_stats:
+                    value = current_stats.get(field, 0) * CURRENT_WEIGHT + prior_stats.get(field, 0) * PRIOR_WEIGHT
+                elif current_stats:
+                    value = current_stats.get(field, 0)
+                else:
+                    value = prior_stats.get(field, 0)
+                weighted_positions[position][field] = round(value, 2)
 
-    games = game_rows(current_games)
-    prior_games_out = game_rows(prior_games)
+        payload["weightedAverageAllowed"] = weighted_positions
+        (defense_dir / f"{team}.json").write_text(
+            json.dumps(payload, separators=(",", ":"))
+        )
 
-    if not games and not prior_games_out:
-        return None
-
-    totals = {}
-    averages = {}
-    for field in STAT_FIELDS:
-        vals = [g.get(field, 0) for g in games]
-        totals[field] = round(sum(vals), 2)
-        averages[field] = round(sum(vals) / len(vals), 2) if vals else 0
-
-    return {
-        "gsisId": pid,
-        "name": player.get("display_name") or f"{player.get('first_name','')} {player.get('last_name','')}".strip(),
-        "position": player.get("position"),
-        "team": player.get("latest_team"),
-        "currentSeason": CURRENT_SEASON,
-        "priorSeason": PRIOR_SEASON,
-        "currentGames": games,
-        "priorGames": prior_games_out,
-        "currentTotals": totals,
-        "currentAverages": averages,
-        "gamesPlayed": len(games),
-    }
+    return len(team_data)
 
 
 def main():
     OUT.mkdir(exist_ok=True)
+
     players = fetch_csv(PLAYER_URL)
-    current = season_rows(CURRENT_SEASON)
-    try:
-        prior = season_rows(PRIOR_SEASON)
-    except Exception as exc:
-        print(f"Prior-season data unavailable; continuing without it: {exc}")
-        prior = pd.DataFrame()
+    players["gsis_id"] = players["gsis_id"].fillna("").astype(str)
 
-    players_out = {}
-    for _, row in players.iterrows():
-        player = row.to_dict()
-        summary = summarize_player(player, current, prior)
-        if summary:
-            players_out[summary["gsisId"]] = summary
+    current = season_rows(CURRENT_SEASON, players)
+    prior = season_rows(PRIOR_SEASON, players)
 
-    payload = {
-        "schemaVersion": 1,
-        "generatedAt": datetime.now(timezone.utc).isoformat(),
+    index, player_count = build_players(players, current, prior)
+    defense_count = build_defense(current, prior)
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    metadata = {
+        "schemaVersion": 2,
+        "generatedAt": generated_at,
         "currentSeason": CURRENT_SEASON,
         "priorSeason": PRIOR_SEASON,
-        "weights": {"currentSeason": 0.90, "priorSeason": 0.10},
+        "weights": {"currentSeason": CURRENT_WEIGHT, "priorSeason": PRIOR_WEIGHT},
         "source": "nflverse",
-        "playerCount": len(players_out),
-        "players": players_out,
+        "playerCount": player_count,
+        "defenseTeamCount": defense_count,
+        "regularSeasonOnly": True,
+        "dataNote": "nflverse updates are not a live in-game feed.",
     }
-    (OUT / "players.json").write_text(json.dumps(payload, separators=(",", ":")))
 
-    print(f"Generated data for {len(players_out)} players.")
+    (OUT / "index.json").write_text(json.dumps({
+        **metadata,
+        "players": index,
+    }, separators=(",", ":")))
+
+    (OUT / "metadata.json").write_text(
+        json.dumps(metadata, separators=(",", ":"))
+    )
+
+    print(
+        f"Generated {player_count} player files and "
+        f"{defense_count} opponent-defense files."
+    )
 
 
 if __name__ == "__main__":
